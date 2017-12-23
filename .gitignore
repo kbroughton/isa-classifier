@@ -1,3 +1,4 @@
 *.pyc
 **/data/*
 text_embedding/
+.ipynb_checkpoints
