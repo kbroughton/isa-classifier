@@ -9,6 +9,7 @@ import numpy as np
 import os
 import random
 import requests
+import sys
 import time
 import uuid
 
@@ -201,6 +202,9 @@ def load_dir(path):
             for filename in filenames:
                 if filename.endswith('.json'):
                     merged = merge_data(merged, load(os.path.join(root, filename)))
+    else:
+        merged = load(os.path.abspath(path)
+)
     return merged
 
 def merge_data(dict1, dict2):
@@ -228,26 +232,32 @@ def hex_data(base64_binary_data, stride=1, expected_len=None):
     # Should check that we aren't discarding https://docs.python.org/2/library/base64.html
     # Characters that are neither in the normal base-64 alphabet nor the
     # alternative alphabet are discarded prior to the padding check.
+    # Only python2 version does checking and uses stride, expected_len as it was found
+    # that data was uniformly 0 misfits.
     misfits = []
     hex_X = []
 
     for data in base64_binary_data:
-        byte_strings = []
         data = base64.b64decode(data)
-        for i in range(0, len(data) , stride):
-            byte_strings.append(data[i:i+stride])
-        # probably not needed for most text_embeddings, but since most seem 32 or 36 it might help
-        if expected_len:
-            delta = len(byte_strings) - expected_len
-            div = delta/stride
-            remainder = delta % stride
-            if remainder or (delta < 0):
-                misfits.append(byte_strings)
-            else:
-                byte_strings.extend(['\x00'*stride]*div)
-        hex_X.append([ binascii.hexlify(e) for e in byte_strings ])
 
-    return np.array(hex_X), misfits
+        if sys.version_info > (3,0):
+            hex_X.append([ binascii.hexlify(data) ])
+        else:
+            byte_strings = []
+            for i in range(0, len(data) , stride):
+                byte_strings.append(data[i:i+stride])
+            # probably not needed for most text_embeddings, but since most seem 32 or 36 it might help
+            if expected_len:
+                delta = len(byte_strings) - expected_len
+                div = delta/stride
+                remainder = delta % stride
+                if remainder or (delta < 0):
+                    print('misfit data', byte_strings)
+                else:
+                    byte_strings.extend(['\x00'*stride]*div)
+            hex_X.append([ binascii.hexlify(e) for e in byte_strings ])
+
+    return np.array(hex_X)
 
 def class_to_ones_hot(answers, targets, supported_architectures):
     Y = []
