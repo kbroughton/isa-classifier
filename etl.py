@@ -19,6 +19,7 @@ SUPPORTED_ARCHITECTURES = ["avr", "alphaev56", "arm", "m68k", "mips",
 logging.basicConfig(level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
+
 class Server(object):
     url = 'https://mlb.praetorian.com'
     log = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ class Server(object):
         self.session = requests.session()
         # in a sample of a few dozen, self.binary is either 32 or 36 bytes so pad X to 36 byte columns
         self.binary  = None
-        self.hash    = None
+        self.hashes    = []
         self.wins    = 0
         self.targets = []
         self.rate_limit_count = 0
@@ -37,6 +38,7 @@ class Server(object):
         self.failure_record = []
         self.start_time = datetime.datetime.now()
         self.response = None
+        self.email = None
 
     def _request(self, route, method='get', data=None):
         while True:
@@ -74,18 +76,30 @@ class Server(object):
     def get(self):
         r = self._request("/challenge")
         self.targets = r.get('target', [])
-        # removed base64.base64decode(r.get('binary', '')) to allow writes to disk without re-encoding
+        # removed base64.base64decode(r.get('binary', '')) to keep raw data raw
         self.binary  = r.get('binary', '')
         return r
 
     def post(self, target):
         r = self._request("/solve", method="post", data={"target": target})
         self.wins = r.get('correct', 0)
-        self.hash = r.get('hash', self.hash)
+        hash = r.get('hash', None)
+        if hash:
+            self.log.info("You win! {}".format(hash))
+            self.collect_hash()
         self.ans  = r.get('target', 'unknown')
         return r
     
-    def get_data(self, number=10000):
+    def collect_hash(self):
+        r = self._request("/hash", method="post", data={"email": self.email})
+        #hash = r.get('hash', None)
+        print('hash_response is {}'.format(r))
+        self.hashes.append(r)
+        # reset the session to earn more hashes
+        self.session.close()
+        self.session = requests.session()
+        
+    def get_data(self, number=10000, model=None, email=None):
         """
         Retrieves data in format
         @param number: nubmer of samples to return
@@ -94,65 +108,63 @@ class Server(object):
         targets =  [ "avr", "x86_64", ... ]
         answers = [one item from targets,]
         """
+        if email:
+            self.email = email
+            
         data = {}
         # If we grab a large data set make it a little more efficient by pre-allocating
         data['binary_data'] = [None]*number
         data['targets'] = [None]*number
         data['answers'] = [None]*number
         for i in range(number):
-            count = 0
+            self.count = 0
             self.get()
-            while((self.status_code != 200) and (count < MAX_RETRIES) ):
+            while((self.status_code != 200) and (self.count < MAX_RETRIES) ):
                 print('Status code != 200. Retrying')
-                count = count + 1
+                self.count = self.count + 1
                 self.get()
             data['binary_data'][i] = self.binary
             data['targets'][i] = self.targets
-            self.post(self.targets[0])
-            while((self.status_code != 200) and (count < MAX_RETRIES) ):
+            if model:
+                X = hex_data([self.binary])
+                probs = model.predict_proba(X)    # array of shape [1,12]
+                targets = class_to_ones_hot_targets([self.targets], model.classes_.tolist())
+                #print('data', X)
+                #print('probs', probs)
+                #print('targets', targets)
+                guess_arch = guess_arch_name(model, X, targets)
+            else:
+                guess_arch = self.targets[0]
+            self.post(guess_arch)
+            while((self.status_code != 200) and (self.count < MAX_RETRIES) ):
                 print('post status code {}'.format(self.status_code))
-                count = count + 1
-                self.post(self.targets[0])
+                self.count = self.count + 1
+                self.post(guess_arch)
+            #print(i, type(i), self.ans, X, type(data['answers']))
             data['answers'][i] = self.ans
+            
         return data
     
-    def get_data_sets(self, num_train=1024, num_test=128, num_dev=128):
+    def get_data_sets(self, num_train=1024, num_test=128, num_dev=128, model=None, email=None):
         """
+        @param model: If we have a trained model, make trained guesses while downloading data
+        
         @returns {'train': {'binary_data': [num_train values],
                             'targets': [num_train [6 values]],
                             'answers': [num_train values],
                   'dev': format as with 'train',
                   'test': format as with 'train'
         }
-        @param name_prefix: Write data to a file of this name. If None, do not write
         """
         data = {}
-        data['train'] = self.get_data(num_train)
-        data['dev'] = self.get_data(num_dev)
-        data['test'] = self.get_data(num_test)
+        data['train'] = self.get_data(num_train, model=model, email=email)
+        data['dev'] = self.get_data(num_dev, model=model, email=email)
+        data['test'] = self.get_data(num_test, model=model, email=email)
         return data
         
-        
-def submit(number):
-    s = Server()
 
-    for _ in range(number):
-        # query the /challenge endpoint
-        s.get()
-
-        # choose a random target and /solve
-        target = random.choice(s.targets)
-        s.post(target)
-
-        s.log.info("Guess:[{: >9}]   Answer:[{: >9}]   Wins:[{: >3}]".format(target, s.ans, s.wins))
-
-        # 500 consecutive correct answers are required to win
-        # very very unlikely with current code
-        if s.hash:
-            s.log.info("You win! {}".format(s.hash))    
-
-
-
+# We only use the server class for interacting with the api
+# The methods below can be used with stored data    
 
         
 def store(data, root_dir=None):
@@ -241,7 +253,7 @@ def hex_data(base64_binary_data, stride=1, expected_len=None):
         data = base64.b64decode(data)
 
         if sys.version_info > (3,0):
-            hex_X.append([ binascii.hexlify(data) ])
+            hex_X.append(binascii.hexlify(data).decode('utf-8'))
         else:
             byte_strings = []
             for i in range(0, len(data) , stride):
@@ -259,19 +271,62 @@ def hex_data(base64_binary_data, stride=1, expected_len=None):
 
     return np.array(hex_X)
 
-def class_to_ones_hot(answers, targets, supported_architectures):
-    Y = []
-    allowed_Y = []
-    for answer, target in zip(answers, targets):
-        y = [0]*len(supported_architectures)
-        index = supported_architectures.index(answer)
-        y[index] = 1
-        Y.append(y)
-        target_hot = [0]*len(supported_architectures)
-        for j, arch in enumerate(target):
-            index = supported_architectures.index(arch)
-            target_hot[index] = 1
-        allowed_Y.append(target_hot)
-    return np.array(Y), np.array(allowed_Y) 
+def class_to_ones_hot_answers(answers, classes):
+    """
+    Take an list of answers as strings and convert to array of ones hot
+    
+    @param answers: (m, 1) array of strings
+    @param classes: len(classes) array of strings
+    @returns: (m, len(classes)) array of 0s and 1s
+    """
+    get_arch_index = np.vectorize(lambda x: classes.index(x))
+    answer_indices = get_arch_index(np.array(answers))
+    hots = np.zeros(shape=(len(answers),len(classes)))
+    hots[np.arange(len(answers)), answer_indices] = 1
+    return hots
 
-        
+def class_to_ones_hot_targets(targets, classes):
+    """
+    Take an list of targets as strings and convert to array of ones hot
+    
+    @param answers: (m, 1) array of strings
+    @param classes: len(classes) array of strings
+    @returns: (m, len(classes)) array of 0s and 1s
+    """
+    get_arch_index = np.vectorize(lambda x: classes.index(x))
+    target_indices = get_arch_index(np.array(targets))
+    hots = np.zeros(shape=(len(targets),len(classes)))
+    # loop over the six columns of targets array
+    for idx in range(target_indices.shape[1]):
+        hots[np.arange(len(targets)), target_indices[:,idx]] = 1
+    return hots
+
+def class_to_ones_hot(answers, targets, classes):
+    """
+    Converts lists to arrays and strings to ones-hot
+    
+    param answers: length m list of strings
+    param targets: length m list of [6 strings]
+    @returns (m, len(classes) answers, (m, len(classes) targets in ones-hot
+    """
+    return class_to_ones_hot_answers(answers, classes), class_to_ones_hot_targets(targets, classes) 
+
+
+def guess_arch_name(model, X, allowed_Y, use_targets=True):
+    """
+    Get the arch name prediction from the probabilities in ones-hot
+    
+    model: model trained on (m, 1) input
+    X: numerical array of shape (m, 1)
+    targets: ones-hot array of shape (m, n_classes), ignored if use_targets = False
+    use_targets: if True, Improve our chances by taking the max over the possible targets (6 instead of 12)
+    
+    returns: (m, 1) of the most likely ISA arch names 
+    """
+    probs = model.predict_proba(X)
+    get_arch = np.vectorize(lambda x: model.classes_.__getitem__(x))
+    if use_targets:
+        return get_arch(np.argmax(probs*allowed_Y, axis=1))
+    else:
+        return get_arch(np.argmax(probs, axis=1))
+    
