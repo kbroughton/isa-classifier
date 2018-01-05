@@ -1,0 +1,3 @@
+
+*.ipynb filter=ipynb_stripout
+/sklearn/output/*.ipynb filter=
